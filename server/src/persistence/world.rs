@@ -31,6 +31,26 @@ fn io(context: &str) -> impl FnOnce(std::io::Error) -> PersistenceError + '_ {
 pub const ENV_WORLD: &str = "VELOREN_REALM_WORLD";
 /// Seconds between rtsim uploads (default 600; shutdown always uploads).
 pub const ENV_SYNC: &str = "VELOREN_REALM_SYNC_SECS";
+/// Shard name in the directory (default `Veloren shard <world>`).
+pub const ENV_SHARD_NAME: &str = "VELOREN_REALM_SHARD_NAME";
+/// Address players connect to (default `127.0.0.1:14004`).
+pub const ENV_SHARD_ADDRESS: &str = "VELOREN_REALM_SHARD_ADDRESS";
+/// Player cap shown in the directory (default 100).
+pub const ENV_SHARD_MAX_PLAYERS: &str = "VELOREN_REALM_SHARD_MAX_PLAYERS";
+
+/// This server's directory listing, from the environment.
+pub fn shard_listing() -> api::RegisterShard {
+    let world = world_id();
+    api::RegisterShard {
+        world,
+        name: std::env::var(ENV_SHARD_NAME).unwrap_or_else(|_| format!("Veloren shard {}", world.0)),
+        address: std::env::var(ENV_SHARD_ADDRESS).unwrap_or_else(|_| "127.0.0.1:14004".to_owned()),
+        max_players: std::env::var(ENV_SHARD_MAX_PLAYERS)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
+    }
+}
 
 pub fn world_id() -> api::WorldId {
     api::WorldId(
@@ -58,19 +78,25 @@ pub struct WorldStore {
 }
 
 impl WorldStore {
-    /// Spawn a bridge and claim the world (a no-op if this host already owns it).
+    /// Spawn a bridge and register this shard (claims the world on first use,
+    /// updates the directory listing afterwards; gives the host its mint budget).
     pub fn open(thread: &'static str) -> Result<Self, PersistenceError> {
         let mut bridge = Bridge::spawn(thread, false)?;
-        let world = world_id();
-        let claimed: Result<(), api::ApiError> = bridge.call("claim_world", world)?;
-        claimed.map_err(|e| {
+        let listing = shard_listing();
+        let world = listing.world;
+        let registered: Result<(), api::ApiError> = bridge.call("register_shard", &listing)?;
+        registered.map_err(|e| {
             PersistenceError::OtherError(format!(
-                "world {} cannot be claimed by this host: {e:?} (another host owns it; set \
-                 {ENV_WORLD}, or use that host's identity)",
+                "shard {} cannot be registered by this host: {e:?} (another host owns this \
+                 world id: set {ENV_WORLD}; or the listing is invalid: {ENV_SHARD_NAME}, \
+                 {ENV_SHARD_ADDRESS}; or this host is frozen)",
                 world.0
             ))
         })?;
-        info!(world = world.0, thread, "world claimed on the realm");
+        info!(
+            world = world.0, name = %listing.name, address = %listing.address, thread,
+            "shard registered on the realm"
+        );
         Ok(Self {
             bridge,
             world,

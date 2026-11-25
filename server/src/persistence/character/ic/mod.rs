@@ -683,15 +683,28 @@ pub fn commit_saves(
                 .find(|r| r.id == id)
                 .filter(|r| r.reason.is_replay_of(save.delta.expected_revision))
                 .map(|_| api::Revision(save.delta.expected_revision.0 + 1));
-            match applied.or(replay) {
-                Some(revision) => {
+            let reason = result.rejected.iter().find(|r| r.id == id).map(|r| &r.reason);
+            match (applied.or(replay), reason) {
+                (Some(revision), _) => {
                     baselines().insert(save.char_id, Baseline {
                         revision,
                         ..save.after
                     });
                 },
-                None => {
-                    let reason = result.rejected.iter().find(|r| r.id == id);
+                (None, Some(api::RejectReason::Moved)) => {
+                    // The player joined another shard; that shard owns the character now.
+                    warn!(char = save.char_id, "save dropped: the player has moved to another shard");
+                    baselines().remove(&save.char_id);
+                },
+                (None, Some(api::RejectReason::MintBudget { needed, available })) => {
+                    // Keep the old baseline: the next save resends the same change and
+                    // passes once the host's budget has refilled.
+                    warn!(
+                        char = save.char_id, needed, available,
+                        "save deferred: this host's mint budget is exhausted (retrying next save)"
+                    );
+                },
+                (None, reason) => {
                     failures.push(format!("character {}: {:?}", save.char_id, reason));
                     // Force a reload before the next save of this character.
                     baselines().remove(&save.char_id);
