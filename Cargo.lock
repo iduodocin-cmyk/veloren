@@ -9095,6 +9095,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloren-ic-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "veloren-network"
 version = "0.3.0"
 dependencies = [
@@ -9225,6 +9232,7 @@ dependencies = [
  "veloren-common-net",
  "veloren-common-state",
  "veloren-common-systems",
+ "veloren-ic-api",
  "veloren-network",
  "veloren-query-server",
  "veloren-rtsim",

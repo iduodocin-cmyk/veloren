@@ -269,15 +269,22 @@ impl Server {
             info!("Authentication is disabled");
         }
 
-        report_stage(ServerInitStage::DbMigrations);
-        // Run pending DB migrations (if any)
-        debug!("Running DB migrations...");
-        persistence::run_migrations(&database_settings);
+        if persistence::ic_enabled() {
+            info!("Persistence: Internet Computer realm (VELOREN_PERSISTENCE=ic); SQLite disabled");
+            if let Err(e) = persistence::ic_preflight() {
+                panic!("IC persistence is not reachable, refusing to start: {e}");
+            }
+        } else {
+            report_stage(ServerInitStage::DbMigrations);
+            // Run pending DB migrations (if any)
+            debug!("Running DB migrations...");
+            persistence::run_migrations(&database_settings);
 
-        report_stage(ServerInitStage::DbVacuum);
-        // Vacuum database
-        debug!("Vacuuming database...");
-        persistence::vacuum_database(&database_settings);
+            report_stage(ServerInitStage::DbVacuum);
+            // Vacuum database
+            debug!("Vacuuming database...");
+            persistence::vacuum_database(&database_settings);
+        }
 
         let database_settings = Arc::new(RwLock::new(database_settings));
 

@@ -27,6 +27,18 @@ use std::{
 };
 use tracing::info;
 
+/// True when `VELOREN_PERSISTENCE=ic` selects the Internet Computer backend.
+/// In that mode SQLite is never opened (no migrations, vacuum or database file).
+pub fn ic_enabled() -> bool { character::ic::enabled() }
+
+/// Start-up check for the IC backend: spawn one bridge and complete a round trip,
+/// so a missing or unreachable realm stops the server with a clear message.
+pub fn ic_preflight() -> Result<(), String> {
+    character::ic::Bridge::spawn("preflight")
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
 /// A struct of the components that are persisted to the DB for each character
 #[derive(Debug)]
 pub struct PersistedComponents {

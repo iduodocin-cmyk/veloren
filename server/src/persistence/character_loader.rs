@@ -1,6 +1,6 @@
 use crate::persistence::{
     ConnectionMode, DatabaseSettings, PersistedComponents,
-    character::{load_character_data, load_character_list},
+    character::{ic, load_character_data, load_character_list},
     error::PersistenceError,
     establish_connection,
 };
@@ -91,6 +91,17 @@ impl CharacterLoader {
         let builder = std::thread::Builder::new().name("persistence_loader".into());
         builder
             .spawn(move || {
+                if super::ic_enabled() {
+                    let mut bridge = ic::Bridge::spawn("loader")
+                        .unwrap_or_else(|e| panic!("persistence loader: {e}"));
+                    for request in internal_rx {
+                        let response = CharacterLoader::process_request_ic(request, &mut bridge);
+                        if let Err(e) = internal_tx.send(response) {
+                            error!(?e, "Could not send character loader response");
+                        }
+                    }
+                    return;
+                }
                 // Unwrap here is safe as there is no code that can panic when the write lock is
                 // taken that could cause the RwLock to become poisoned.
                 //
@@ -147,6 +158,34 @@ impl CharacterLoader {
                             ?result,
                             "Error loading character data for character_id: {}", character_id.0
                         );
+                    }
+                    CharacterScreenResponseKind::CharacterData(Box::new(result))
+                },
+            },
+        })
+    }
+
+    /// `process_request` for the Internet Computer backend.
+    fn process_request_ic(
+        (entity, kind): CharacterLoaderRequest,
+        bridge: &mut ic::Bridge,
+    ) -> CharacterUpdaterMessage {
+        CharacterUpdaterMessage::CharacterScreenResponse(CharacterScreenResponse {
+            target_entity: entity,
+            response_kind: match kind {
+                CharacterLoaderRequestKind::LoadCharacterList { player_uuid } => {
+                    CharacterScreenResponseKind::CharacterList(ic::load_character_list(
+                        bridge,
+                        &player_uuid,
+                    ))
+                },
+                CharacterLoaderRequestKind::LoadCharacterData {
+                    player_uuid,
+                    character_id,
+                } => {
+                    let result = ic::load_character_data(bridge, player_uuid, character_id);
+                    if let Err(e) = &result {
+                        error!(?e, character_id = character_id.0, "Error loading character from realm");
                     }
                     CharacterScreenResponseKind::CharacterData(Box::new(result))
                 },

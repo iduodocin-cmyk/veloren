@@ -3,6 +3,7 @@ use common::{character::CharacterId, event::PermanentChange};
 
 use crate::persistence::{
     ConnectionMode, DatabaseSettings, EditableComponents, PersistedComponents, VelorenConnection,
+    character::ic,
     character_loader::{
         CharacterScreenResponse, CharacterScreenResponseKind, CharacterUpdaterMessage,
     },
@@ -112,6 +113,10 @@ impl CharacterUpdater {
         let builder = std::thread::Builder::new().name("persistence_updater".into());
         let handle = builder
             .spawn(move || {
+                if super::ic_enabled() {
+                    ic_updater_loop(update_rx, response_tx, disconnect_all_clients_requested_clone);
+                    return;
+                }
                 // Unwrap here is safe as there is no code that can panic when the write lock is
                 // taken that could cause the RwLock to become poisoned.
                 let mut conn =
@@ -514,6 +519,138 @@ fn execute_character_edit(
     };
 
     Ok(CharacterUpdaterMessage::CharacterScreenResponse(response))
+}
+
+/// The updater thread for the Internet Computer backend: same actions and the
+/// same integrity policy as the SQLite loop, persisted through `realm-bridge`.
+fn ic_updater_loop(
+    update_rx: crossbeam_channel::Receiver<CharacterUpdaterAction>,
+    response_tx: crossbeam_channel::Sender<CharacterUpdaterMessage>,
+    disconnect_all_clients_requested: Arc<AtomicBool>,
+) {
+    let mut bridge =
+        ic::Bridge::spawn("updater").unwrap_or_else(|e| panic!("persistence updater: {e}"));
+    while let Ok(action) = update_rx.recv() {
+        match action {
+            CharacterUpdaterAction::BatchUpdate { batch_id, updates } => {
+                if disconnect_all_clients_requested.load(Ordering::Relaxed) {
+                    debug!("Skipping persistence due to pending disconnection of all clients");
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                if let Err(e) = execute_batch_update_ic(&mut bridge, batch_id, updates) {
+                    error!(
+                        ?e,
+                        "Error during realm batch update, disconnecting all clients to avoid \
+                         loss of data integrity."
+                    );
+                    disconnect_all_clients_requested.store(true, Ordering::Relaxed);
+                }
+                debug!(batch_id, ms = started.elapsed().as_millis(), "realm batch finished");
+                if let Err(e) =
+                    response_tx.send(CharacterUpdaterMessage::DatabaseBatchCompletion(batch_id))
+                {
+                    error!(?e, "Could not send DatabaseBatchCompletion message");
+                }
+            },
+            CharacterUpdaterAction::CreateCharacter {
+                entity,
+                player_uuid,
+                character_alias,
+                persisted_components,
+            } => {
+                let response = CharacterScreenResponse {
+                    target_entity: entity,
+                    response_kind: CharacterScreenResponseKind::CharacterCreation(
+                        ic::create_character(
+                            &mut bridge,
+                            &player_uuid,
+                            &character_alias,
+                            persisted_components,
+                        ),
+                    ),
+                };
+                if response.is_err() {
+                    error!(?response.response_kind, %player_uuid, "realm character creation failed");
+                }
+                if let Err(e) =
+                    response_tx.send(CharacterUpdaterMessage::CharacterScreenResponse(response))
+                {
+                    error!(?e, "Could not send character creation response");
+                }
+            },
+            CharacterUpdaterAction::EditCharacter {
+                entity,
+                player_uuid,
+                character_id,
+                character_alias,
+                editable_components,
+                trusted_change,
+            } => {
+                let response = CharacterScreenResponse {
+                    target_entity: entity,
+                    response_kind: CharacterScreenResponseKind::CharacterEdit(
+                        ic::edit_character(
+                            &mut bridge,
+                            editable_components,
+                            trusted_change,
+                            character_id,
+                            &player_uuid,
+                            character_alias.as_deref(),
+                        ),
+                    ),
+                };
+                if let Err(e) =
+                    response_tx.send(CharacterUpdaterMessage::CharacterScreenResponse(response))
+                {
+                    error!(?e, "Could not send character edit response");
+                }
+            },
+            CharacterUpdaterAction::DisconnectedSuccess => {
+                info!("CharacterUpdater received DisconnectedSuccess event, resuming batch updates");
+                disconnect_all_clients_requested.store(false, Ordering::Relaxed);
+            },
+        }
+    }
+}
+
+/// `execute_batch_update` for the Internet Computer backend: deletions go
+/// straight to the realm; saves are diffed and sent as one batch per owner.
+fn execute_batch_update_ic(
+    bridge: &mut ic::Bridge,
+    batch_id: u64,
+    updates: Vec<DatabaseActionKind>,
+) -> Result<(), PersistenceError> {
+    let mut saves = Vec::new();
+    for update in updates {
+        match update {
+            DatabaseActionKind::UpdateCharacter(box (
+                character_id,
+                skill_set,
+                inventory,
+                pets,
+                waypoint,
+                active_abilities,
+                map_marker,
+            )) => saves.extend(ic::prepare_save(
+                character_id,
+                &skill_set,
+                &inventory,
+                &pets,
+                waypoint,
+                &active_abilities,
+                map_marker,
+            )?),
+            DatabaseActionKind::DeleteCharacter {
+                requesting_player_uuid,
+                character_id,
+            } => ic::delete_character(bridge, &requesting_player_uuid, character_id)?,
+        }
+    }
+    let count = saves.len();
+    ic::commit_saves(bridge, batch_id, saves)?;
+    debug!(batch_id, characters = count, "realm batch committed");
+    Ok(())
 }
 
 impl Drop for CharacterUpdater {

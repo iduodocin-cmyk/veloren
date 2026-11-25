@@ -42,6 +42,9 @@ use tracing::{debug, error, trace, warn};
 /// called--do not assume it's safe to make these public!
 mod conversions;
 
+/// Internet Computer backend (`VELOREN_PERSISTENCE=ic`), see `ic/mod.rs`.
+pub(in crate::persistence) mod ic;
+
 pub(crate) type EntityId = i64;
 
 const CHARACTER_PSEUDO_CONTAINER_DEF_ID: &str = "veloren.core.pseudo_containers.character";
