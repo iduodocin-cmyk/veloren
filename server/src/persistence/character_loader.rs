@@ -92,7 +92,7 @@ impl CharacterLoader {
         builder
             .spawn(move || {
                 if super::ic_enabled() {
-                    let mut bridge = ic::Bridge::spawn("loader")
+                    let mut bridge = ic::Bridge::spawn("loader", false)
                         .unwrap_or_else(|e| panic!("persistence loader: {e}"));
                     for request in internal_rx {
                         let response = CharacterLoader::process_request_ic(request, &mut bridge);

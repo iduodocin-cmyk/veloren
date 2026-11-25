@@ -529,7 +529,7 @@ fn ic_updater_loop(
     disconnect_all_clients_requested: Arc<AtomicBool>,
 ) {
     let mut bridge =
-        ic::Bridge::spawn("updater").unwrap_or_else(|e| panic!("persistence updater: {e}"));
+        ic::Bridge::spawn("updater", false).unwrap_or_else(|e| panic!("persistence updater: {e}"));
     while let Ok(action) = update_rx.recv() {
         match action {
             CharacterUpdaterAction::BatchUpdate { batch_id, updates } => {

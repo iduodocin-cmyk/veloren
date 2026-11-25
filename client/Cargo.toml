@@ -40,6 +40,9 @@ network = { package = "veloren-network", path = "../network", features = [
 
 byteorder = "1.3.2"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+# Internet Computer login (servers advertising an `ic:` auth provider).
+veloren-ic-api = { path = "../../api" }
+serde_json = { workspace = true }
 quinn = { workspace = true, features = ["rustls"] }
 rustls = { workspace = true }
 hickory-resolver = { version = "0.26.1", features = [

@@ -8885,6 +8885,7 @@ dependencies = [
  "rustls",
  "rustyline",
  "serde",
+ "serde_json",
  "specs",
  "tokio",
  "tracing",
@@ -8897,6 +8898,7 @@ dependencies = [
  "veloren-common-net",
  "veloren-common-state",
  "veloren-common-systems",
+ "veloren-ic-api",
  "veloren-network",
  "veloren-voxygen-i18n-helpers",
 ]

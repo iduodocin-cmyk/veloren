@@ -4,7 +4,8 @@ use std::sync::Arc;
 use common_net::msg::ServerInfo;
 use network::{ConnectAddr, Network};
 use rustls::client::danger::ServerCertVerified;
-use tracing::warn;
+use tracing::{info, warn};
+use veloren_ic_api as ic;
 
 use crate::{Error, addr};
 
@@ -104,6 +105,106 @@ pub(crate) async fn resolve_token_or_username(
             None => Ok(username),
         },
     }
+}
+
+/// Path of the realm-bridge executable (same variable as the server).
+const ENV_BRIDGE: &str = "VELOREN_REALM_BRIDGE";
+/// Realm connection file (REALM_URL / REALM_CANISTER / REALM_LOCAL).
+const ENV_REALM: &str = "VELOREN_REALM_ENV";
+/// The player's key (PEM). Unset: a dev identity derived from the username.
+const ENV_IDENTITY: &str = "VELOREN_REALM_IDENTITY";
+
+/// The auth provider of a server whose logins go through the realm canister,
+/// as advertised by `ic_auth_provider`: `ic:<world>:<host principal hex>`.
+/// Such servers ask for a username only; no password leaves this machine.
+pub(crate) fn ic_provider(auth_provider: &Option<String>) -> Option<&str> {
+    auth_provider.as_deref().filter(|p| p.starts_with("ic:"))
+}
+
+/// Internet Computer login (Phase 3): sign as the player with `realm-bridge`,
+/// call `join_world` (lets this server's host act for us in its world and
+/// registers a one-time nonce) and return the `ic:<nonce>:<name>` token the
+/// server redeems.
+pub(crate) async fn resolve_ic_login(credentials: Credentials, provider: &str) -> Result<String, Error> {
+    let name = match credentials {
+        Credentials::Username(name) | Credentials::UsernamePassword(name, _) => name,
+    };
+    let (world, host) = ic::parse_ic_auth_provider(provider)
+        .ok_or_else(|| Error::AuthServerUrlInvalid(provider.to_owned()))?;
+    let provider = provider.to_owned();
+    tokio::task::spawn_blocking(move || ic_login_blocking(world, host, name, &provider))
+        .await
+        .map_err(|e| Error::AuthErr(format!("IC login task failed: {e}")))?
+}
+
+fn ic_login_blocking(
+    world: ic::WorldId,
+    host: ic::PrincipalBytes,
+    name: String,
+    provider: &str,
+) -> Result<String, Error> {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+    };
+    let var = |key: &str| {
+        std::env::var(key).map_err(|_| {
+            Error::AuthErr(format!(
+                "This server logs in with the Internet Computer ({provider}); set {ENV_BRIDGE} \
+                 and {ENV_REALM} (make veloren-client does this)"
+            ))
+        })
+    };
+    let program = var(ENV_BRIDGE)?;
+    let realm = var(ENV_REALM)?;
+    let mut command = Command::new(&program);
+    command.args(["--env", &realm, "--name", "client-login"]);
+    match std::env::var(ENV_IDENTITY) {
+        Ok(pem) if !pem.is_empty() => {
+            command.args(["--identity", &pem]);
+        },
+        _ => {
+            warn!(
+                %name,
+                "IC login with a dev identity derived from the username: anyone can \
+                 impersonate it. Development only (set {ENV_IDENTITY} to a key)."
+            );
+            command.args(["--dev-identity", &name]);
+        },
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| Error::AuthErr(format!("cannot start {program}: {e}")))?;
+    let request = serde_json::json!({
+        "id": 1,
+        "method": "login",
+        "args": { "world": world, "host": host, "name": name },
+    });
+    let reply = (|| -> std::io::Result<String> {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        writeln!(stdin, "{request}")?;
+        stdin.flush()?;
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("piped stdout")).read_line(&mut line)?;
+        Ok(line)
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    let reply = reply.map_err(|e| Error::AuthErr(format!("realm-bridge: {e}")))?;
+    let reply: serde_json::Value = serde_json::from_str(&reply).map_err(|e| {
+        Error::AuthErr(format!("realm-bridge gave no answer ({e}); see its log lines above"))
+    })?;
+    if let Some(err) = reply.get("error") {
+        return Err(Error::AuthErr(format!("IC login failed: {err}")));
+    }
+    let token = reply["ok"]["token"]
+        .as_str()
+        .ok_or_else(|| Error::AuthErr(format!("IC login: unexpected reply {reply}")))?;
+    info!(%name, world = world.0, "joined the world on the Internet Computer");
+    Ok(token.to_owned())
 }
 
 pub(crate) async fn connect_quic(

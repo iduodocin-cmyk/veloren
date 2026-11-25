@@ -29,8 +29,6 @@ fn io(context: &str) -> impl FnOnce(std::io::Error) -> PersistenceError + '_ {
 
 /// World id in the realm canister (default 1).
 pub const ENV_WORLD: &str = "VELOREN_REALM_WORLD";
-/// Dev identity that owns the world (Phase 2/4; Phase 3 uses the host's Internet Identity).
-pub const ENV_HOST: &str = "VELOREN_REALM_HOST";
 /// Seconds between rtsim uploads (default 600; shutdown always uploads).
 pub const ENV_SYNC: &str = "VELOREN_REALM_SYNC_SECS";
 
@@ -42,8 +40,6 @@ pub fn world_id() -> api::WorldId {
             .unwrap_or(1),
     )
 }
-
-fn host() -> String { std::env::var(ENV_HOST).unwrap_or_else(|_| "dev-host".to_owned()) }
 
 pub fn sync_interval() -> Duration {
     Duration::from_secs(
@@ -57,7 +53,6 @@ pub fn sync_interval() -> Duration {
 /// One bridge acting as the world's host, with the blob versions it last saw.
 pub struct WorldStore {
     bridge: Bridge,
-    host: String,
     world: api::WorldId,
     versions: HashMap<api::BlobKind, u64>,
 }
@@ -65,20 +60,19 @@ pub struct WorldStore {
 impl WorldStore {
     /// Spawn a bridge and claim the world (a no-op if this host already owns it).
     pub fn open(thread: &'static str) -> Result<Self, PersistenceError> {
-        let mut bridge = Bridge::spawn(thread)?;
-        let (host, world) = (host(), world_id());
-        let claimed: Result<(), api::ApiError> = bridge.call("claim_world", &host, world)?;
+        let mut bridge = Bridge::spawn(thread, false)?;
+        let world = world_id();
+        let claimed: Result<(), api::ApiError> = bridge.call("claim_world", world)?;
         claimed.map_err(|e| {
             PersistenceError::OtherError(format!(
-                "world {} cannot be claimed by host {host:?}: {e:?} (another host owns it; set \
-                 {ENV_WORLD} or {ENV_HOST})",
+                "world {} cannot be claimed by this host: {e:?} (another host owns it; set \
+                 {ENV_WORLD}, or use that host's identity)",
                 world.0
             ))
         })?;
-        info!(world = world.0, %host, thread, "world claimed on the realm");
+        info!(world = world.0, thread, "world claimed on the realm");
         Ok(Self {
             bridge,
-            host,
             world,
             versions: HashMap::new(),
         })
@@ -88,7 +82,7 @@ impl WorldStore {
     pub fn get(&mut self, kind: api::BlobKind) -> Result<Option<Vec<u8>>, PersistenceError> {
         let started = Instant::now();
         let blob: Result<Option<api::Blob>, api::ApiError> =
-            self.bridge.call("get_blob", &self.host, api::BlobRef {
+            self.bridge.call("get_blob", api::BlobRef {
                 world: self.world,
                 kind,
             })?;
@@ -126,7 +120,7 @@ impl WorldStore {
         let compressed = bytes.len();
         let expected_version = self.versions[&kind];
         let stored: Result<u64, api::ApiError> =
-            self.bridge.call("put_blob", &self.host, api::PutBlob {
+            self.bridge.call("put_blob", api::PutBlob {
                 world: self.world,
                 kind,
                 expected_version,

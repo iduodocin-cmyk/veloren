@@ -1044,8 +1044,18 @@ impl Client {
         register_stream: &mut Stream,
         ping_stream: &Stream,
     ) -> Result<(), Error> {
+        // An `ic:` server verifies logins with the realm canister: the frontend
+        // treats it like a server without auth (username only, nothing to trust,
+        // no password sent anywhere) and the login happens below.
+        let ic_provider = init::ic_provider(&server_info.auth_provider);
+        let frontend_provider = if ic_provider.is_some() {
+            None
+        } else {
+            server_info.auth_provider.clone()
+        };
+
         // quick sanitation check if auth is trusted
-        if !credential_provider.auth_trusted(&server_info.auth_provider) {
+        if !credential_provider.auth_trusted(&frontend_provider) {
             return Err(Error::AuthServerNotTrusted);
         }
 
@@ -1053,7 +1063,7 @@ impl Client {
         debug!("query frontend for credentials...");
         let ping_timer = tokio::time::interval(Duration::from_secs(2));
         let timeout = tokio::time::sleep(Duration::from_secs(300));
-        let credential_future = credential_provider.get_credentials(&server_info.auth_provider);
+        let credential_future = credential_provider.get_credentials(&frontend_provider);
         tokio::pin!(ping_timer);
         tokio::pin!(timeout);
         tokio::pin!(credential_future);
@@ -1075,8 +1085,10 @@ impl Client {
         }?;
 
         debug!("resolving token_or_username...");
-        let token_or_username =
-            init::resolve_token_or_username(credentials, &server_info.auth_provider).await?;
+        let token_or_username = match ic_provider {
+            Some(provider) => init::resolve_ic_login(credentials, provider).await?,
+            None => init::resolve_token_or_username(credentials, &server_info.auth_provider).await?,
+        };
 
         debug!("Registering client...");
         register_stream.send(ClientRegister {

@@ -1,5 +1,6 @@
 use crate::{
     Client,
+    persistence::ic_login,
     settings::{AdminRecord, Ban, Banlist, WhitelistRecord, banlist::NormalizedIpAddr},
 };
 use authc::{AuthClient, AuthClientError, AuthToken, Uuid};
@@ -8,9 +9,13 @@ use common::comp::AdminRole;
 use common_net::msg::RegisterError;
 use hashbrown::HashMap;
 use specs::Component;
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 use tokio::{runtime::Runtime, sync::oneshot};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use veloren_ic_api as api;
 
 /// Determines whether a user is banned, given a ban record connected to a user,
 /// the `AdminRecord` of that user (if it exists), and the current time.
@@ -44,6 +49,23 @@ fn derive_uuid(username: &str) -> Uuid {
 /// derive Uuid for "singleplayer" is a pub fn
 pub fn derive_singleplayer_uuid() -> Uuid { derive_uuid("singleplayer") }
 
+/// Veloren uuid of an Internet Computer principal: stable for the principal and
+/// never equal to a username-derived uuid (different input domain).
+fn ic_uuid(principal: &api::PrincipalBytes) -> Uuid {
+    derive_uuid(&format!("ic-principal:{}", api::hex(&principal.0)))
+}
+
+/// Internet Computer login (`VELOREN_PERSISTENCE=ic`).
+struct IcLogin {
+    /// Bridge signing as the world's host; logins are verified one at a time.
+    bridge: Mutex<ic_login::Bridge>,
+    /// Advertised as `ServerInfo::auth_provider`: `ic:<world>:<host principal hex>`.
+    provider: String,
+    /// Names seen at login since start-up, for admin commands that take a name
+    /// (`/ban`, `admin add`, whitelist …). Uuids are stable per principal.
+    names: Mutex<HashMap<String, Uuid>>,
+}
+
 pub struct PendingLogin {
     pending_r: oneshot::Receiver<Result<(String, Uuid), RegisterError>>,
 }
@@ -64,6 +86,7 @@ impl Component for PendingLogin {
 pub struct LoginProvider {
     runtime: Arc<Runtime>,
     auth_server: Option<Arc<AuthClient>>,
+    ic: Option<Arc<IcLogin>>,
 }
 
 impl LoginProvider {
@@ -86,11 +109,51 @@ impl LoginProvider {
         Self {
             runtime,
             auth_server,
+            ic: None,
         }
+    }
+
+    /// Log players in with the realm canister (Phase 3, `VELOREN_PERSISTENCE=ic`).
+    pub fn new_ic(bridge: ic_login::Bridge, runtime: Arc<Runtime>) -> Self {
+        let world = crate::persistence::world::world_id();
+        let provider = api::ic_auth_provider(world, &bridge.me);
+        info!(
+            %provider, dev_login = ic_login::dev_login(),
+            "Login: Internet Computer (players join this world from their own client)"
+        );
+        if ic_login::dev_login() {
+            warn!(
+                "VELOREN_REALM_DEV_LOGIN=1: plain usernames are accepted with name-derived \
+                 identities. Anyone can impersonate anyone. Development only."
+            );
+        }
+        Self {
+            runtime,
+            auth_server: None,
+            ic: Some(Arc::new(IcLogin {
+                bridge: Mutex::new(bridge),
+                provider,
+                names: Mutex::new(HashMap::new()),
+            })),
+        }
+    }
+
+    /// `auth_provider` to advertise when logins go through the realm.
+    pub fn ic_auth_provider(&self) -> Option<String> {
+        self.ic.as_ref().map(|ic| ic.provider.clone())
     }
 
     pub fn verify(&self, username_or_token: &str) -> PendingLogin {
         let (pending_s, pending_r) = oneshot::channel();
+
+        if let Some(ic) = &self.ic {
+            let ic = Arc::clone(ic);
+            let token = username_or_token.to_string();
+            self.runtime.spawn_blocking(move || {
+                let _ = pending_s.send(Self::verify_ic(&ic, &token));
+            });
+            return PendingLogin { pending_r };
+        }
 
         match &self.auth_server {
             // Token from auth server expected
@@ -181,6 +244,36 @@ impl LoginProvider {
         }
     }
 
+    fn verify_ic(ic: &IcLogin, token: &str) -> Result<(String, Uuid), RegisterError> {
+        // Log only the name part: the nonce is a bearer secret until redeemed.
+        let shown = api::parse_session_token(token).map_or_else(
+            || format!("username {token:?}"),
+            |(_, name)| format!("ic token for {name:?}"),
+        );
+        let mut bridge = ic.bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match ic_login::login(&mut bridge, token) {
+            Ok(login) => {
+                let uuid = ic_uuid(&login.principal);
+                ic_login::register_player(&uuid.to_string(), login.principal);
+                let name = if login.name.trim().is_empty() {
+                    login.principal_text.chars().take(11).collect()
+                } else {
+                    login.name
+                };
+                info!(%name, %uuid, principal = %login.principal_text, "IC login verified");
+                ic.names
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(name.clone(), uuid);
+                Ok((name, uuid))
+            },
+            Err(e) => {
+                warn!(login = %shown, error = %e, "IC login refused");
+                Err(RegisterError::AuthError(e))
+            },
+        }
+    }
+
     async fn query(
         srv: Arc<AuthClient>,
         username_or_token: &str,
@@ -204,6 +297,15 @@ impl LoginProvider {
     }
 
     pub fn username_to_uuid(&self, username: &str) -> Result<Uuid, AuthClientError> {
+        if let Some(ic) = &self.ic {
+            let names = ic.names.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(uuid) = names.get(username) {
+                return Ok(*uuid);
+            }
+            warn!(%username, "no IC player with this name logged in since start-up");
+            // authc has no "unknown user" variant; callers only log or discard it.
+            return Err(AuthClientError::InsecureSchema);
+        }
         match &self.auth_server {
             Some(srv) => {
                 //TODO: optimize

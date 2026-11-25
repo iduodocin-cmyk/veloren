@@ -269,10 +269,12 @@ impl Server {
             info!("Authentication is disabled");
         }
 
+        let mut ic_login_bridge = None;
         if persistence::ic_enabled() {
             info!("Persistence: Internet Computer realm (VELOREN_PERSISTENCE=ic); SQLite disabled");
-            if let Err(e) = persistence::ic_preflight() {
-                panic!("IC persistence is not reachable, refusing to start: {e}");
+            match persistence::ic_preflight() {
+                Ok(bridge) => ic_login_bridge = Some(bridge),
+                Err(e) => panic!("IC persistence is not reachable, refusing to start: {e}"),
             }
         } else {
             report_stage(ServerInitStage::DbMigrations);
@@ -385,10 +387,15 @@ impl Server {
             .ecs_mut()
             .insert(EventBus::<chunk_serialize::ChunkSendEntry>::default());
         state.ecs_mut().insert(Locations::default());
-        state.ecs_mut().insert(LoginProvider::new(
-            settings.auth_server_address.clone(),
-            Arc::clone(&runtime),
-        ));
+        state.ecs_mut().insert(match ic_login_bridge {
+            Some(bridge) => {
+                if settings.auth_server_address.is_some() {
+                    warn!("auth_server_address is ignored: IC mode logs players in with the realm");
+                }
+                LoginProvider::new_ic(bridge, Arc::clone(&runtime))
+            },
+            None => LoginProvider::new(settings.auth_server_address.clone(), Arc::clone(&runtime)),
+        });
         state.ecs_mut().insert(HwStats {
             hardware_threads: num_cpus::get() as u32,
             rayon_threads: num_cpus::get() as u32,
@@ -717,12 +724,13 @@ impl Server {
 
     pub fn get_server_info(&self) -> ServerInfo {
         let settings = self.state.ecs().fetch::<Settings>();
+        let ic_provider = self.state.ecs().fetch::<LoginProvider>().ic_auth_provider();
 
         ServerInfo {
             name: settings.server_name.clone(),
             git_hash: *common::util::GIT_HASH,
             git_timestamp: *common::util::GIT_TIMESTAMP,
-            auth_provider: settings.auth_server_address.clone(),
+            auth_provider: ic_provider.or_else(|| settings.auth_server_address.clone()),
         }
     }
 

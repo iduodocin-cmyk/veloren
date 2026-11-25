@@ -11,9 +11,12 @@
 //!   the fixed ids 1–4 and are not stored as rows.
 //! * Saves send only what changed since the last load/save (a per-character
 //!   baseline shared by the loader and updater threads), not a full rewrite.
-//! * Phase 2 identity: each player acts through a deterministic dev identity
-//!   named by their player uuid (`as`). Phase 3 switches to Internet Identity
-//!   and host grants, and lets one host batch many players per message.
+//! * Identity (Phase 3): the server signs as the world's host. A player logs in
+//!   with `ic:<nonce>:<name>`, which their own client registered with
+//!   `join_world`; `login` redeems it (once) for the player's verified principal.
+//!   The player's Veloren uuid is derived from that principal, and every character
+//!   call is a `host_*` call on the player's behalf. All of a host's saves go in
+//!   one `batch_update` per flush (split only by message size).
 //!
 //! See docs/veloren-persistence-seam.md in the veloren-ic repository.
 
@@ -55,6 +58,8 @@ use std::{
 use tracing::{debug, info, warn};
 use veloren_ic_api as api;
 
+pub use bridge::dev_login;
+
 /// `VELOREN_PERSISTENCE=ic` selects this backend.
 pub fn enabled() -> bool { std::env::var("VELOREN_PERSISTENCE").is_ok_and(|v| v == "ic") }
 
@@ -67,7 +72,6 @@ const RECIPE_BOOK: i64 = api::RECIPE_BOOK_CONTAINER.0 as i64;
 /// What the canister holds for a character, as of the last load or save.
 #[derive(Clone)]
 struct Baseline {
-    owner: String,
     revision: api::Revision,
     character: api::CharacterRow,
     items: BTreeMap<u64, api::ItemRow>,
@@ -82,6 +86,82 @@ static BASELINES: LazyLock<Mutex<HashMap<i64, Baseline>>> =
 
 fn baselines() -> std::sync::MutexGuard<'static, HashMap<i64, Baseline>> {
     BASELINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ------------------------------------------------------------------ players
+
+/// Veloren player uuid (as a string) → the principal that logged in with it.
+/// Filled by `login`; the persistence threads look players up here.
+static PLAYERS: LazyLock<Mutex<HashMap<String, api::PrincipalBytes>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn world() -> api::WorldId { crate::persistence::world::world_id() }
+
+fn player(uuid: &str) -> Result<api::PrincipalBytes, PersistenceError> {
+    PLAYERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(uuid)
+        .cloned()
+        .ok_or_else(|| {
+            PersistenceError::OtherError(format!(
+                "player {uuid} has no verified Internet Computer login on this server"
+            ))
+        })
+}
+
+/// A verified login: who the player is and the name they chose.
+pub struct Login {
+    pub principal: api::PrincipalBytes,
+    pub principal_text: String,
+    pub name: String,
+}
+
+/// Verify a login string on the login bridge.
+/// * `ic:<nonce>:<name>`: redeem the player's `join_world` nonce (single use).
+/// * a plain username, only with `VELOREN_REALM_DEV_LOGIN=1`: join the world as
+///   that name's dev identity first, then redeem, so dev logins take the same path.
+pub fn login(bridge: &mut Bridge, username_or_token: &str) -> Result<Login, String> {
+    let token = if api::parse_session_token(username_or_token).is_some() {
+        username_or_token.to_owned()
+    } else if dev_login() {
+        let name = username_or_token;
+        let host = bridge.me.clone();
+        let reply: serde_json::Value = bridge
+            .call_as("login", name, serde_json::json!({
+                "world": world(),
+                "host": host,
+                "name": name,
+            }))
+            .map_err(|e| format!("dev login for {name:?} failed: {e}"))?;
+        warn!(name, "DEV LOGIN: joined the world with a name-derived identity (not secure)");
+        reply["token"]
+            .as_str()
+            .ok_or_else(|| format!("dev login: unexpected reply {reply}"))?
+            .to_owned()
+    } else {
+        return Err("This server uses Internet Computer login. Update your client, or set \
+                    VELOREN_REALM_DEV_LOGIN=1 on the server for local development."
+            .to_owned());
+    };
+    let reply: serde_json::Value = bridge
+        .call("redeem", serde_json::json!({ "world": world(), "token": token }))
+        .map_err(|e| format!("login refused: {e}"))?;
+    let principal: api::PrincipalBytes = serde_json::from_value(reply["player"].clone())
+        .map_err(|e| format!("login: bad reply {reply}: {e}"))?;
+    Ok(Login {
+        principal,
+        principal_text: reply["principal"].as_str().unwrap_or_default().to_owned(),
+        name: reply["name"].as_str().unwrap_or_default().to_owned(),
+    })
+}
+
+/// Remember which principal a Veloren uuid stands for (after `login`).
+pub fn register_player(uuid: &str, principal: api::PrincipalBytes) {
+    PLAYERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(uuid.to_owned(), principal);
 }
 
 // ------------------------------------------------------------------ conversions
@@ -189,8 +269,13 @@ fn pet_rows(pets: &[PetPersistenceData], next: &mut u64) -> Result<Vec<api::PetR
 // ------------------------------------------------------------------ loader
 
 pub fn load_character_list(bridge: &mut Bridge, uuid: &str) -> CharacterListResult {
-    let list: Vec<api::CharacterSummary> = bridge.call("list_characters", uuid, ())?;
-    list.into_iter()
+    let list: Result<Vec<api::CharacterSummary>, api::ApiError> =
+        bridge.call("host_list_characters", api::HostPlayer {
+            world: world(),
+            player: player(uuid)?,
+        })?;
+    list.map_err(|e| api_error("host_list_characters", e))?
+        .into_iter()
         .map(|s| {
             let id = s.id.0 as i64;
             let model = character_model(id, uuid, &s.character);
@@ -219,8 +304,17 @@ pub fn load_character_data(
     char_id: CharacterId,
 ) -> CharacterDataResult {
     let snap: Result<api::CharacterSnapshot, api::ApiError> =
-        bridge.call("load_character", &uuid, api::CharacterId(char_id.0 as u64))?;
-    let snap = snap.map_err(|e| api_error("load_character", e))?;
+        bridge.call("host_load_character", api::HostCharacter {
+            world: world(),
+            id: api::CharacterId(char_id.0 as u64),
+        })?;
+    let snap = snap.map_err(|e| api_error("host_load_character", e))?;
+    // The host may only touch characters of players who joined with it, but make
+    // sure this one belongs to the player asking for it.
+    if snap.owner != player(&uuid)? {
+        warn!(char = char_id.0, %uuid, "character belongs to another player");
+        return Err(PersistenceError::CharacterDataError);
+    }
 
     let model = character_model(char_id.0, &uuid, &snap.character);
     let (waypoint, map_marker): (Option<Waypoint>, Option<MapMarker>) =
@@ -285,7 +379,6 @@ pub fn load_character_data(
     };
 
     baselines().insert(char_id.0, Baseline {
-        owner: uuid,
         revision: snap.revision,
         character: snap.character,
         items: snap.items.into_iter().map(|i| (i.item_id.0, i)).collect(),
@@ -347,8 +440,12 @@ pub fn create_character(
         },
     };
     let created: Result<api::CharacterId, api::ApiError> =
-        bridge.call("create_character", uuid, new)?;
-    let id = created.map_err(|e| api_error("create_character", e))?;
+        bridge.call("host_create_character", api::HostCreate {
+            world: world(),
+            player: player(uuid)?,
+            new,
+        })?;
+    let id = created.map_err(|e| api_error("host_create_character", e))?;
     info!(char = id.0, uuid, "created character in realm");
     load_character_list(bridge, uuid).map(|list| (CharacterId(id.0 as i64), list))
 }
@@ -387,8 +484,11 @@ pub fn edit_character(
         },
     };
     let revision: Result<api::Revision, api::ApiError> =
-        bridge.call("edit_character", uuid, edit)?;
-    revision.map_err(|e| api_error("edit_character", e))?;
+        bridge.call("host_edit_character", api::HostEdit {
+            world: world(),
+            edit,
+        })?;
+    revision.map_err(|e| api_error("host_edit_character", e))?;
     // The revision moved; the next save reloads the baseline.
     baselines().remove(&character_id.0);
     load_character_list(bridge, uuid).map(|list| (character_id, list))
@@ -402,21 +502,31 @@ pub fn delete_character(
     uuid: &str,
     char_id: CharacterId,
 ) -> Result<(), PersistenceError> {
+    // The character must be one of this player's (it is in their list).
+    let mine = load_character_list(bridge, uuid)?
+        .iter()
+        .any(|c| c.character.id == Some(char_id));
+    if !mine {
+        warn!(char = char_id.0, uuid, "delete ignored: not one of this player's characters");
+        return Ok(());
+    }
     let deleted: Result<(), api::ApiError> =
-        bridge.call("delete_character", uuid, api::CharacterId(char_id.0 as u64))?;
+        bridge.call("host_delete_character", api::HostCharacter {
+            world: world(),
+            id: api::CharacterId(char_id.0 as u64),
+        })?;
     match deleted {
         Ok(()) | Err(api::ApiError::NotFound | api::ApiError::NotAuthorized) => {
             baselines().remove(&char_id.0);
             Ok(())
         },
-        Err(e) => Err(api_error("delete_character", e)),
+        Err(e) => Err(api_error("host_delete_character", e)),
     }
 }
 
 /// A computed save: the delta to send and the baseline to keep if it is applied.
 pub struct PendingSave {
     char_id: i64,
-    owner: String,
     delta: api::CharacterDelta,
     after: Baseline,
 }
@@ -515,32 +625,55 @@ pub fn prepare_save(
     };
     Ok(Some(PendingSave {
         char_id: char_id.0,
-        owner: after.owner.clone(),
         delta,
         after,
     }))
 }
 
-/// Send prepared saves, one `batch_update` per owner (Phase 2 identity model).
-/// Any rejection that is not a replay of an applied save is an error, so the
-/// caller can apply Veloren's usual "disconnect everyone" integrity policy.
+/// Batches stay under this many bytes of JSON (JSON is never smaller than the
+/// IC Wire encoding the bridge sends), leaving headroom for the envelope.
+const BATCH_JSON_BYTES: usize = api::MAX_BATCH_BYTES - 64 * 1024;
+
+/// Split saves into batches that each fit one ingress message.
+fn split_by_size(saves: Vec<PendingSave>) -> Vec<Vec<PendingSave>> {
+    let mut batches: Vec<Vec<PendingSave>> = Vec::new();
+    let mut bytes = 0;
+    for save in saves {
+        let size = serde_json::to_vec(&save.delta).map_or(BATCH_JSON_BYTES, |v| v.len());
+        match batches.last_mut() {
+            Some(batch) if bytes + size <= BATCH_JSON_BYTES => {
+                bytes += size;
+                batch.push(save);
+            },
+            _ => {
+                bytes = size;
+                batches.push(vec![save]);
+            },
+        }
+    }
+    batches
+}
+
+/// Send prepared saves of all players as the host: one `batch_update` per
+/// flush (more only if it would not fit one message). Any rejection that is not
+/// a replay of an applied save is an error, so the caller can apply Veloren's
+/// usual "disconnect everyone" integrity policy.
 pub fn commit_saves(
     bridge: &mut Bridge,
     batch_id: u64,
     saves: Vec<PendingSave>,
 ) -> Result<(), PersistenceError> {
-    let mut by_owner: BTreeMap<String, Vec<PendingSave>> = BTreeMap::new();
-    for save in saves {
-        by_owner.entry(save.owner.clone()).or_default().push(save);
-    }
     let mut failures = Vec::new();
-    for (owner, saves) in by_owner {
+    let batches = split_by_size(saves);
+    let parts = batches.len();
+    for (part, saves) in batches.into_iter().enumerate() {
         let batch = api::BatchUpdate {
-            world: api::WorldId(0),
+            world: world(),
             batch_id,
             deltas: saves.iter().map(|s| s.delta.clone()).collect(),
         };
-        let result: api::BatchResult = bridge.call("batch_update", &owner, batch)?;
+        debug!(batch_id, part = part + 1, parts, characters = saves.len(), "sending batch_update");
+        let result: api::BatchResult = bridge.call("batch_update", batch)?;
         for save in saves {
             let id = save.delta.id;
             let applied = result.applied.iter().find(|a| a.id == id).map(|a| a.revision);
