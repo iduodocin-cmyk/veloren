@@ -65,6 +65,8 @@ serde_json = { workspace = true }
 # Internet Computer persistence (VELOREN_PERSISTENCE=ic). Path: the veloren-ic repository
 # that contains this fork as veloren/. Serde-only types, no IC dependencies.
 veloren-ic-api = { path = "../../api" }
+# Compresses world blobs (rtsim msgpack ~39x) before upload; already used by common-net.
+flate2 = "1.0.20"
 rand = { workspace = true }
 hashbrown = { workspace = true }
 parking_lot = { version = "0.12" }

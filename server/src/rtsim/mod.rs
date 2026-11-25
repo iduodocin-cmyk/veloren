@@ -46,16 +46,32 @@ impl RtSim {
     ) -> Result<Self, ron::Error> {
         let file_path = Self::get_file_path(data_dir);
 
-        info!("Looking for rtsim data at {}...", file_path.display());
+        let on_ic = crate::persistence::ic_enabled();
+        if on_ic {
+            info!("Looking for rtsim data on the Internet Computer realm...");
+        } else {
+            info!("Looking for rtsim data at {}...", file_path.display());
+        }
         let data = 'load: {
             if std::env::var("RTSIM_NOLOAD").map_or(true, |v| v != "1") {
-                match File::open(&file_path) {
-                    Ok(file) => {
+                // IC mode: the realm canister is the source of truth; no local file.
+                let source: io::Result<Box<dyn io::Read>> = if on_ic {
+                    match load_from_ic() {
+                        Ok(Some(raw)) => Ok(Box::new(io::Cursor::new(raw))),
+                        Ok(None) => Err(io::ErrorKind::NotFound.into()),
+                        Err(e) => Err(io::Error::other(e)),
+                    }
+                } else {
+                    File::open(&file_path)
+                        .map(|file| Box::new(io::BufReader::new(file)) as Box<dyn io::Read>)
+                };
+                match source {
+                    Ok(reader) => {
                         info!("Rtsim data found. Attempting to load...");
 
                         let ignore_version = std::env::var("RTSIM_IGNORE_VERSION").is_ok();
 
-                        match Data::from_reader(io::BufReader::new(file)) {
+                        match Data::from_reader(reader) {
                             Err(ReadError::VersionMismatch(_)) if !ignore_version => {
                                 warn!(
                                     "Rtsim data version mismatch (implying a breaking change), \
@@ -72,6 +88,13 @@ impl RtSim {
                                 } else {
                                     break 'load *data;
                                 }
+                            },
+                            Err(ReadError::Load(err)) if on_ic => {
+                                error!(
+                                    "Rtsim data from the realm failed to load: {}; generating \
+                                     afresh (the next sync replaces it)",
+                                    err
+                                );
                             },
                             Err(ReadError::Load(err)) => {
                                 error!("Rtsim data failed to load: {}", err);
@@ -319,7 +342,11 @@ impl RtSim {
             trace!("Starting rtsim data save thread...");
             let (tx, rx) = unbounded();
             let file_path = self.file_path.clone();
-            (tx, thread::spawn(move || save_thread(file_path, rx)))
+            if crate::persistence::ic_enabled() {
+                (tx, thread::spawn(move || ic_save_thread(file_path, rx)))
+            } else {
+                (tx, thread::spawn(move || save_thread(file_path, rx)))
+            }
         });
 
         // Send rtsim data to the save thread
@@ -368,6 +395,83 @@ fn save_thread(file_path: PathBuf, rx: Receiver<Data>) {
             Ok(_) => debug!("Rtsim data saved."),
             Err(e) => error!("Saving rtsim data failed: {}", e),
         }
+    }
+}
+
+/// Set when rtsim data was loaded from the realm: the save thread then waits a
+/// full interval before its first upload instead of re-sending identical data.
+static LOADED_FROM_IC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn load_from_ic() -> Result<Option<Vec<u8>>, String> {
+    use crate::persistence::world::WorldStore;
+    let mut store = WorldStore::open("rtsim-load").map_err(|e| e.to_string())?;
+    let raw = store
+        .get(veloren_ic_api::BlobKind::Rtsim)
+        .map_err(|e| e.to_string())?;
+    LOADED_FROM_IC.store(raw.is_some(), std::sync::atomic::Ordering::Relaxed);
+    Ok(raw)
+}
+
+/// IC mode: keep the newest rtsim data and upload it every
+/// `VELOREN_REALM_SYNC_SECS` and on shutdown (when the sender is dropped);
+/// server_config files are uploaded alongside when they changed. Nothing is
+/// written to disk.
+fn ic_save_thread(file_path: PathBuf, rx: Receiver<Data>) {
+    use crate::persistence::world::{ConfigSync, WorldStore, sync_interval};
+    use crossbeam_channel::RecvTimeoutError;
+    use std::time::Duration;
+
+    // file_path = <data_dir>/rtsim/data.dat
+    let data_dir = file_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let mut store = match WorldStore::open("rtsim") {
+        Ok(store) => store,
+        Err(e) => {
+            error!("Rtsim sync to the realm is unavailable, world state will NOT be saved: {}", e);
+            while rx.recv().is_ok() {}
+            return;
+        },
+    };
+    let mut config = ConfigSync::new(&data_dir);
+    let interval = sync_interval();
+    info!(secs = interval.as_secs(), "Rtsim data syncs to the realm");
+    let upload = |store: &mut WorldStore, data: Data, config: &mut ConfigSync| {
+        let mut raw = Vec::new();
+        match data.write_to(&mut raw) {
+            Ok(()) => {
+                if let Err(e) = store.put(veloren_ic_api::BlobKind::Rtsim, &raw) {
+                    error!("Saving rtsim data to the realm failed: {}", e);
+                }
+            },
+            Err(e) => error!("Serializing rtsim data failed: {}", e),
+        }
+        if let Err(e) = config.sync(store) {
+            error!("Saving server_config to the realm failed: {}", e);
+        }
+    };
+    let mut pending = None;
+    // Fresh worlds upload at the first save; worlds just loaded from the realm wait.
+    let mut last_upload = LOADED_FROM_IC
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(Instant::now);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(data) => pending = Some(data),
+            Err(RecvTimeoutError::Timeout) => {},
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if pending.is_some() && last_upload.is_none_or(|t| t.elapsed() >= interval) {
+            upload(&mut store, pending.take().expect("checked"), &mut config);
+            last_upload = Some(Instant::now());
+        }
+    }
+    // Shutdown (`save(true)` dropped the sender): always persist the latest state.
+    if let Some(data) = pending {
+        info!("Uploading final rtsim data to the realm...");
+        upload(&mut store, data, &mut config);
     }
 }
 

@@ -27,6 +27,9 @@ use std::{
 };
 use tracing::info;
 
+/// World state on the IC: rtsim data and server_config (Phase 4).
+pub mod world;
+
 /// True when `VELOREN_PERSISTENCE=ic` selects the Internet Computer backend.
 /// In that mode SQLite is never opened (no migrations, vacuum or database file).
 pub fn ic_enabled() -> bool { character::ic::enabled() }

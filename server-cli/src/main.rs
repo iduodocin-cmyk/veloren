@@ -122,6 +122,12 @@ fn main() -> io::Result<()> {
         world::init();
     }
 
+    // IC persistence: the realm canister holds the world's server_config; restore
+    // it before the settings load (no-op for SQLite persistence).
+    if server::persistence::ic_enabled() {
+        server::persistence::world::restore_server_config(&server_data_dir);
+    }
+
     // Load server settings
     let mut server_settings = server::Settings::load(&server_data_dir);
     let mut editable_settings = server::EditableSettings::load(&server_data_dir);
