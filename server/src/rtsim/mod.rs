@@ -452,6 +452,23 @@ fn ic_save_thread(file_path: PathBuf, rx: Receiver<Data>) {
             error!("Saving server_config to the realm failed: {}", e);
         }
     };
+    // Shard heartbeat: the directory shows live shards and their player counts.
+    // Every few minutes, or sooner (≥ 30 s apart) when the count changes.
+    let mut reported: Option<(u32, Instant)> = None;
+    let mut heartbeat = |store: &mut WorldStore| {
+        let players = crate::persistence::world::online();
+        let due = reported.is_none_or(|(n, t)| {
+            t.elapsed().as_secs() >= veloren_ic_api::SHARD_STATUS_INTERVAL_SECS
+                || (n != players && t.elapsed() >= Duration::from_secs(30))
+        });
+        if due {
+            match store.status(players) {
+                Ok(()) => info!(players, "shard status reported to the realm"),
+                Err(e) => warn!("Shard status report failed: {}", e),
+            }
+            reported = Some((players, Instant::now()));
+        }
+    };
     let mut pending = None;
     // Fresh worlds upload at the first save; worlds just loaded from the realm wait.
     let mut last_upload = LOADED_FROM_IC
@@ -467,6 +484,7 @@ fn ic_save_thread(file_path: PathBuf, rx: Receiver<Data>) {
             upload(&mut store, pending.take().expect("checked"), &mut config);
             last_upload = Some(Instant::now());
         }
+        heartbeat(&mut store);
     }
     // Shutdown (`save(true)` dropped the sender): always persist the latest state.
     if let Some(data) = pending {

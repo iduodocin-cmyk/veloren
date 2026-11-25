@@ -38,6 +38,14 @@ pub const ENV_SHARD_ADDRESS: &str = "VELOREN_REALM_SHARD_ADDRESS";
 /// Player cap shown in the directory (default 100).
 pub const ENV_SHARD_MAX_PLAYERS: &str = "VELOREN_REALM_SHARD_MAX_PLAYERS";
 
+/// Players connected right now (set every tick by the server, read by the
+/// shard heartbeat).
+static ONLINE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_online(players: u32) { ONLINE.store(players, std::sync::atomic::Ordering::Relaxed); }
+
+pub fn online() -> u32 { ONLINE.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// This server's directory listing, from the environment.
 pub fn shard_listing() -> api::RegisterShard {
     let world = world_id();
@@ -131,6 +139,15 @@ impl WorldStore {
             "world blob loaded from realm"
         );
         Ok(Some(raw))
+    }
+
+    /// Shard heartbeat: player count for the directory, and a sign of life.
+    pub fn status(&mut self, players: u32) -> Result<(), PersistenceError> {
+        let reply: Result<(), api::ApiError> = self.bridge.call("shard_status", api::ShardStatus {
+            world: self.world,
+            players,
+        })?;
+        reply.map_err(|e| PersistenceError::OtherError(format!("shard_status refused: {e:?}")))
     }
 
     /// Deflate and upload a blob, replacing the stored version atomically.

@@ -207,6 +207,96 @@ fn ic_login_blocking(
     Ok(token.to_owned())
 }
 
+/// One live shard from the realm's directory (`list_shards`).
+#[derive(Clone, Debug)]
+pub struct IcShard {
+    /// What the server list connects to (`host:port`).
+    pub address: String,
+    /// Shown instead of the address: name, players, world.
+    pub label: String,
+}
+
+static SHARD_LABELS: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+    std::sync::OnceLock::new();
+
+/// Label for a server-list entry that came from the shard directory.
+pub fn ic_shard_label(address: &str) -> Option<&'static str> {
+    SHARD_LABELS.get()?.get(address).map(String::as_str)
+}
+
+/// Read the live shard directory from the realm (Phase 5b), if this client is
+/// configured for the Internet Computer (`VELOREN_REALM_BRIDGE` and
+/// `VELOREN_REALM_ENV`). Blocking, about a second; call once at start-up.
+/// Also remembers labels for `ic_shard_label`.
+pub fn ic_shard_directory() -> Option<Vec<IcShard>> {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+    };
+    let program = std::env::var(ENV_BRIDGE).ok()?;
+    let realm = std::env::var(ENV_REALM).ok()?;
+    let run = || -> Result<serde_json::Value, String> {
+        let mut child = Command::new(&program)
+            .args(["--env", &realm, "--name", "directory", "--dev-identity", "directory"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot start {program}: {e}"))?;
+        let request = serde_json::json!({ "id": 1, "method": "list_shards" });
+        let line = (|| -> std::io::Result<String> {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            writeln!(stdin, "{request}")?;
+            stdin.flush()?;
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().expect("piped stdout")).read_line(&mut line)?;
+            Ok(line)
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let line = line.map_err(|e| e.to_string())?;
+        let reply: serde_json::Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+        reply
+            .get("ok")
+            .cloned()
+            .ok_or_else(|| format!("unexpected reply {reply}"))
+    };
+    let shards = match run() {
+        Ok(list) => list,
+        Err(e) => {
+            warn!(%e, "IC shard directory unavailable");
+            return None;
+        },
+    };
+    let shards: Vec<IcShard> = shards
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let address = s["address"].as_str()?.to_owned();
+            let label = format!(
+                "{} ({}/{}) · shard {}",
+                s["name"].as_str().unwrap_or("?"),
+                s["players"].as_u64().unwrap_or(0),
+                s["max_players"].as_u64().unwrap_or(0),
+                s["world"].as_u64().unwrap_or(0),
+            );
+            Some(IcShard { address, label })
+        })
+        .collect();
+    info!(shards = shards.len(), "IC shard directory loaded");
+    for s in &shards {
+        info!(address = %s.address, label = %s.label, "IC shard");
+    }
+    let _ = SHARD_LABELS.set(
+        shards
+            .iter()
+            .map(|s| (s.address.clone(), s.label.clone()))
+            .collect(),
+    );
+    Some(shards)
+}
+
 pub(crate) async fn connect_quic(
     network: &Network,
     hostname: String,

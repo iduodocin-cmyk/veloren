@@ -91,7 +91,10 @@ impl Screen {
                         state,
                         Row::with_children(vec![
                             Space::new(Length::FillPortion(5), Length::Units(0)).into(),
-                            Text::new(server.as_ref())
+                            Text::new(
+                                client::ic_shard_label(server.as_ref())
+                                    .unwrap_or(server.as_ref()),
+                            )
                                 .size(fonts.cyri.scale(30))
                                 .width(Length::FillPortion(95))
                                 .vertical_alignment(iced::VerticalAlignment::Center)

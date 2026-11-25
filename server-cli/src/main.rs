@@ -72,7 +72,16 @@ fn main() -> io::Result<()> {
     };
 
     // Load settings
-    let settings = settings::Settings::load().ok_or(io::ErrorKind::Other)?;
+    #[allow(unused_mut)]
+    let mut settings = settings::Settings::load().ok_or(io::ErrorKind::Other)?;
+    // Several shards on one machine (IC fleet testing): VELOREN_SHARD_PORT=P moves
+    // the game port to P, the web API to P+1 and the query port to P+2.
+    let shard_port: Option<u16> = std::env::var("VELOREN_SHARD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok());
+    if let Some(port) = shard_port {
+        settings.web_address.set_port(port + 1);
+    }
 
     #[cfg(not(target_os = "windows"))]
     {
@@ -135,6 +144,18 @@ fn main() -> io::Result<()> {
     // Apply no_auth modifier to the settings
     if no_auth {
         server_settings.auth_server_address = None;
+    }
+    if let Some(port) = shard_port {
+        for protocol in &mut server_settings.gameserver_protocols {
+            match protocol {
+                server::settings::Protocol::Tcp { address }
+                | server::settings::Protocol::Quic { address, .. } => address.set_port(port),
+            }
+        }
+        if let Some(query) = &mut server_settings.query_address {
+            query.set_port(port + 2);
+        }
+        info!(port, "VELOREN_SHARD_PORT: game {port}, web {}, query {}", port + 1, port + 2);
     }
 
     // Relative to data_dir

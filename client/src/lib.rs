@@ -4,6 +4,7 @@
 pub mod addr;
 pub mod error;
 mod init;
+pub use init::{IcShard, ic_shard_directory, ic_shard_label};
 
 // Reexports
 pub use crate::{

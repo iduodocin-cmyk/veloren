@@ -111,6 +111,19 @@ fn main() {
     let mut settings = Settings::load(&config_dir);
     settings.display_warnings();
 
+    // Internet Computer shard directory (Phase 5b): live shards go first in the
+    // server list, labelled with name and player count; the first one is selected.
+    if let Some(shards) = client::ic_shard_directory() {
+        let servers = &mut settings.networking.servers;
+        for shard in shards.iter().rev() {
+            servers.retain(|s| s != &shard.address);
+            servers.insert(0, shard.address.clone());
+        }
+        if let Some(first) = shards.first() {
+            settings.networking.default_server.clone_from(&first.address);
+        }
+    }
+
     panic_handler::set_panic_hook(log_filename, logs_dir);
 
     // Setup tokio runtime

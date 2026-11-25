@@ -806,6 +806,8 @@ impl Server {
     /// the given duration.
     pub fn tick(&mut self, _input: Input, dt: Duration) -> Result<Vec<Event>, Error> {
         self.state.ecs().write_resource::<Tick>().0 += 1;
+        // Read by the IC shard heartbeat (rtsim sync thread); an atomic store.
+        persistence::world::set_online(self.number_of_players() as u32);
         self.state.ecs().write_resource::<TickStart>().0 = Instant::now();
 
         // Update calendar events as time changes
